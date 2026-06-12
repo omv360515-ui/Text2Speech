@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Telegram TTS Bot – Complete Production Version
-Fixed all syntax errors, missing methods, and pydub audioop issue.
+Telegram TTS Bot – Production Ready for Render
+No transformers, no Rust compilation. Works with Python 3.11+.
 """
 
 import sys
@@ -18,11 +18,8 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import Dict, List, Tuple, Any, Optional
 
-# ========== FIX for pydub + Python 3.14 (missing pyaudioop) ==========
-try:
-    import audioop
-except ImportError:
-    # Create a minimal dummy audioop if missing (prevents pydub crash)
+# ========== FIX: Dummy audioop for pydub (Python 3.14 workaround) ==========
+if 'audioop' not in sys.modules:
     class DummyAudioOp:
         @staticmethod
         def add(*args): return b''
@@ -71,10 +68,8 @@ except ImportError:
     sys.modules['audioop'] = DummyAudioOp
 
 # Now safe to import pydub
-import pydub
 from pydub import AudioSegment
 
-# Other dependencies
 import psutil
 import aiohttp
 import aiosqlite
@@ -97,7 +92,6 @@ class Config:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN missing in .env")
-    ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
     DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///tts_bot.db")
     VOICES_DB_PATH = "voices_data.json"
     AUDIO_OUTPUT_DIR = Path("generated_audio")
@@ -106,7 +100,6 @@ class Config:
     RATE_LIMIT_PERIOD = 60
     PREFERRED_TTS = "edge_tts"
     FALLBACK_TTS = "gtts"
-    SUPPORTED_FORMATS = ["mp3", "wav", "ogg", "m4a", "flac"]
     DEFAULT_FORMAT = "mp3"
     LOG_LEVEL = logging.INFO
 
@@ -178,35 +171,21 @@ class Database:
             rows = await cursor.fetchall()
             return [{"text": r[0], "voice": r[1], "format": r[2], "timestamp": r[3]} for r in rows]
 
-# ========== EMOTION ANALYZER (Lightweight) ==========
+# ========== EMOTION ANALYZER (Lightweight, no transformers) ==========
 class EmotionAnalyzer:
-    def __init__(self):
-        self.use_transformers = False
-        try:
-            if psutil.virtual_memory().available / (1024**3) >= 2.0:
-                from transformers import pipeline
-                self.classifier = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
-                self.use_transformers = True
-                logger.info("Transformer loaded")
-            else:
-                raise MemoryError
-        except:
-            self.use_transformers = False
-            logger.info("Using TextBlob fallback")
-    def analyze(self, text):
-        emotion_map = {"POSITIVE": {"pitch": 15, "speed": 10, "volume": 5},
-                       "NEGATIVE": {"pitch": -15, "speed": -10, "volume": -5},
-                       "NEUTRAL": {"pitch": 0, "speed": 0, "volume": 0}}
-        if self.use_transformers:
-            try:
-                label = self.classifier(text[:512])[0]['label'].upper()
-            except:
-                label = "NEUTRAL"
+    def analyze(self, text: str) -> Tuple[str, Dict[str, int]]:
+        blob = TextBlob(text)
+        polarity = blob.sentiment.polarity
+        if polarity > 0.1:
+            label = "POSITIVE"
+            params = {"pitch": 15, "speed": 10, "volume": 5}
+        elif polarity < -0.1:
+            label = "NEGATIVE"
+            params = {"pitch": -15, "speed": -10, "volume": -5}
         else:
-            blob = TextBlob(text)
-            polarity = blob.sentiment.polarity
-            label = "POSITIVE" if polarity > 0.1 else "NEGATIVE" if polarity < -0.1 else "NEUTRAL"
-        return label, emotion_map.get(label, emotion_map["NEUTRAL"])
+            label = "NEUTRAL"
+            params = {"pitch": 0, "speed": 0, "volume": 0}
+        return label, params
 
 # ========== TTS ENGINE ==========
 class UnifiedTTS:
@@ -224,12 +203,13 @@ class UnifiedTTS:
                     if self.voices:
                         return
             except: pass
-        # Fetch from edge_tts
+        # Fetch live
         try:
             raw = await edge_tts.list_voices()
             self.voices = [{"Name": v["ShortName"], "ShortName": v["ShortName"], "Gender": v.get("Gender","Neutral"), "Locale": v.get("Locale","")} for v in raw]
             with open(self.voices_cache_path, "w") as f:
                 json.dump({"edge_tts": {"voices": self.voices}}, f)
+            logger.info(f"Loaded {len(self.voices)} voices")
         except Exception as e:
             logger.error(f"Voice fetch failed: {e}")
             self.voices = [{"Name":"hi-IN-SwaraNeural","ShortName":"hi-IN-SwaraNeural","Gender":"Female","Locale":"hi-IN"},
@@ -255,7 +235,7 @@ class UnifiedTTS:
             self.cache[cache_key] = audio
             return audio
         except Exception as e:
-            logger.error(f"Primary failed: {e}, falling back")
+            logger.error(f"Primary TTS failed: {e}, falling back")
             audio = await self._call_engine(text, voice, Config.FALLBACK_TTS, 0, 0, 0)
             return await self._convert_format(audio, output_format)
     async def _call_engine(self, text, voice, provider, rate, volume, pitch):
@@ -277,17 +257,6 @@ class UnifiedTTS:
             await loop.run_in_executor(None, lambda: tts.write_to_fp(fp))
             fp.seek(0)
             return fp.read()
-        elif provider == "elevenlabs":
-            if not Config.ELEVENLABS_API_KEY:
-                raise ValueError("No API key")
-            url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice}"
-            headers = {"xi-api-key": Config.ELEVENLABS_API_KEY, "Content-Type": "application/json"}
-            payload = {"text": text, "model_id": "eleven_multilingual_v2"}
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, headers=headers) as resp:
-                    if resp.status != 200:
-                        raise RuntimeError(f"ElevenLabs error {resp.status}")
-                    return await resp.read()
         else:
             raise ValueError("Unknown provider")
     async def _convert_format(self, audio_bytes, target):
@@ -306,15 +275,21 @@ def rate_limit(limit, per):
     def decorator(func):
         @wraps(func)
         async def wrapper(self, update, context, *args, **kwargs):
+            # For callback queries, effective_message might be None; fallback to callback_query.message
             user = update.effective_user
             if not user:
+                return await func(self, update, context, *args, **kwargs)
+            msg = update.effective_message
+            if not msg and update.callback_query:
+                msg = update.callback_query.message
+            if not msg:
                 return await func(self, update, context, *args, **kwargs)
             uid = user.id
             now = datetime.now()
             rate_limit_data[uid] = [t for t in rate_limit_data[uid] if t > now - timedelta(seconds=per)]
             if len(rate_limit_data[uid]) >= limit:
                 wait = (rate_limit_data[uid][0] + timedelta(seconds=per) - now).seconds
-                await update.effective_message.reply_text(f"⏳ रुकिए, {wait} सेकंड बाद प्रयास करें।")
+                await msg.reply_text(f"⏳ रुकिए, {wait} सेकंड बाद प्रयास करें।")
                 return
             rate_limit_data[uid].append(now)
             return await func(self, update, context, *args, **kwargs)
@@ -344,7 +319,8 @@ class TTSBot:
         )
         self.app.add_handler(conv)
         self.app.add_handler(CallbackQueryHandler(self.menu_callback, pattern="^(menu_history|menu_settings|menu_voice)$"))
-        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.direct_tts))
+        # Direct text without command (only if not in conversation)
+        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.direct_tts), group=1)
     async def start(self, update, context):
         user = update.effective_user
         await self.db.add_user(user.id, user.username, user.first_name)
@@ -424,10 +400,38 @@ class TTSBot:
             await update.message.reply_text(f"टेक्स्ट बहुत लंबा है (अधिकतम {Config.MAX_TEXT_LENGTH} अक्षर)")
             return WAITING_FOR_TEXT
         voice = context.user_data.get("selected_voice", "hi-IN-SwaraNeural")
-        # Save to DB for future use
         await self.db.update_user_setting(update.effective_user.id, "voice", voice)
         proc_msg = await update.message.reply_text("🎧 आवाज़ बन रही है...")
         try:
             audio = await self.tts.synthesize(text, voice, output_format=Config.DEFAULT_FORMAT)
             await self.db.add_history_entry(update.effective_user.id, text, voice)
-            await update.message.reply_audio(audio=audio, filename=f"tts_{update.effe
+            await update.message.reply_audio(audio=audio, filename=f"tts_{update.effective_user.id}.mp3")
+        except Exception as e:
+            await update.message.reply_text(f"❌ त्रुटि: {str(e)}")
+        finally:
+            await proc_msg.delete()
+        return ConversationHandler.END
+    async def direct_tts(self, update, context):
+        # Only if not already in a conversation (context.user_data has no state)
+        if context.user_data.get("state") == SELECTING_VOICE:
+            return
+        text = update.message.text
+        if text.startswith('/'):
+            return
+        uid = update.effective_user.id
+        settings = await self.db.get_user_settings(uid)
+        voice = settings.get("voice", "hi-IN-SwaraNeural")
+        proc = await update.message.reply_text("🎧 प्रोसेसिंग...")
+        try:
+            audio = await self.tts.synthesize(text, voice)
+            await self.db.add_history_entry(uid, text, voice)
+            await update.message.reply_audio(audio=audio, filename="speech.mp3")
+        except Exception as e:
+            await update.message.reply_text(f"❌ {e}")
+        finally:
+            await proc.delete()
+    async def menu_callback(self, update, context):
+        query = update.callback_query
+        await query.answer()
+        if query.data == "menu_voice":
+     
