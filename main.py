@@ -1,3 +1,14 @@
+import sys
+# Python 3.11+ backward compatibility patch for pydub
+try:
+    import audioop
+except ImportError:
+    try:
+        from audioop_compat import audioop
+        sys.modules['audioop'] = audioop
+    except ImportError:
+        pass
+
 import os
 import io
 import gc
@@ -43,7 +54,7 @@ class Config:
     
     MAX_TEXT_LENGTH = 5000
     RATE_LIMIT_CALLS = 5
-    RATE_LIMIT_PERIOD = 60  # Seconds
+    RATE_LIMIT_PERIOD = 60
     
     PREFERRED_TTS = "edge_tts"
     FALLBACK_TTS = "gtts"
@@ -55,7 +66,6 @@ Config.AUDIO_OUTPUT_DIR.mkdir(exist_ok=True)
 logging.basicConfig(level=Config.LOG_LEVEL, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("TTSMasterBot")
 
-# Conversation States
 SELECTING_VOICE, WAITING_FOR_TEXT = range(2)
 rate_limit_data = defaultdict(list)
 
@@ -414,18 +424,18 @@ class TTSBot:
         await update.message.reply_text(
             f"👋 स्वागत है {user.first_name}!\n\n"
             "मैं एक इंटेलिजेंट *AI Text-to-Speech (TTS)* बॉट हूँ।\n"
-            "मुझे कोई भी टेक्स्ट मैसेज भेजें, मैं उसका मूड एनालाइज करके उसे रियल साउंडिंग वॉइस में बदल दूँगा।",
+            "मुझे कोई भी टेक्स्ट मैसेज भेजें, मैं उसका मूड एनालाइज करके उसे Real Sounding Voice में बदल दूँगा।",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "📖 *उपलब्ध कमांड्स गाइड:*\n\n"
+            "📖 *उपलब्ध कमान्ड्स गाइड:*\n\n"
             "/start - होम डैशबोर्ड खोलें\n"
             "/voice - 300+ भाषाओं और आवाज़ों की लिस्ट बदलें\n"
             "/settings - आपकी मौजूदा एक्टिव कॉन्फ़िगरेशन\n"
-            "/history - आपके द्वारा बनाए गए पिछले音频 ट्रैक\n\n"
+            "/history - आपके द्वारा बनाए गए पिछले ऑडियो ट्रैक\n\n"
             "💡 *शॉर्टकट:* बिना किसी कमांड के सीधे टेक्स्ट टाइप करें, बोट तुरंत ऑडियो जेनरेट कर देगा।",
             parse_mode="Markdown"
         )
@@ -433,188 +443,4 @@ class TTSBot:
     async def voice_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         voices = await self.tts.list_voices("edge_tts")
         if not voices:
-            await update.message.reply_text("❌ वर्तमान में कोई वॉयस उपलब्ध नहीं है।")
-            return ConversationHandler.END
-        
-        context.user_data["all_voices"] = voices
-        context.user_data["voice_page"] = 0
-        await self._send_voice_page(update, context, 0)
-        return SELECTING_VOICE
-
-    async def voice_workflow_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        voices = await self.tts.list_voices("edge_tts")
-        context.user_data["all_voices"] = voices
-        context.user_data["voice_page"] = 0
-        await self._send_voice_page(update, context, 0)
-        return SELECTING_VOICE
-
-    async def _send_voice_page(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page: int):
-        voices = context.user_data.get("all_voices", [])
-        if not voices:
-            return
-        
-        items_per_page = 50
-        start = page * items_per_page
-        end = start + items_per_page
-        page_voices = voices[start:end]
-        
-        keyboard = []
-        for voice in page_voices:
-            emoji = "👨" if voice["Gender"] == "Male" else "👩" if voice["Gender"] == "Female" else "🤖"
-            name = voice["Name"][:32]
-            keyboard.append([InlineKeyboardButton(f"{emoji} {name}", callback_data=f"voice_{voice['ShortName']}")])
-        
-        nav_buttons = []
-        if page > 0:
-            nav_buttons.append(InlineKeyboardButton("◀️ Previous", callback_data=f"voice_page_{page-1}"))
-        if end < len(voices):
-            nav_buttons.append(InlineKeyboardButton("Next ▶️", callback_data=f"voice_page_{page+1}"))
-        if nav_buttons:
-            keyboard.append(nav_buttons)
-        
-        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="back")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        total_pages = (len(voices) + items_per_page - 1) // items_per_page
-        
-        if update.callback_query:
-            await update.callback_query.edit_message_text(
-                f"🎙️ *Select a voice* (Page {page+1}/{total_pages})\nTotal voices system active: {len(voices)}",
-                reply_markup=reply_markup, parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text(
-                f"🎙️ *Select a voice* (Page {page+1}/{total_pages})",
-                reply_markup=reply_markup, parse_mode="Markdown"
-            )
-
-    async def callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        page = int(query.data.split("_")[2])
-        context.user_data["voice_page"] = page
-        await self._send_voice_page(update, context, page)
-        return SELECTING_VOICE
-
-    async def voice_selected(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        voice_id = query.data.split("_")[1]
-        await self.db.update_user_setting(query.from_user.id, "voice", voice_id)
-        
-        await query.edit_message_text(
-            f"✅ *आवाज़ सफलतापूर्वक बदल दी गई है!*\n🎯 एक्टिव प्रोफाइल: `{voice_id}`\n\n📥 अब मुझे वह टेक्स्ट भेजें जिसका आप ऑडियो बनाना चाहते हैं:",
-            parse_mode="Markdown"
-        )
-        return WAITING_FOR_TEXT
-
-    @rate_limit(limit=5, per=60)
-    async def process_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await self._generate_and_send(update, update.message.text)
-        return ConversationHandler.END
-
-    @rate_limit(limit=5, per=60)
-    async def process_direct_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await self._generate_and_send(update, update.message.text)
-
-    async def _generate_and_send(self, update: Update, text: str):
-        if len(text) > Config.MAX_TEXT_LENGTH:
-            await update.message.reply_text(f"❌ टेक्स्ट काफी लंबा है! अधिकतम सीमा {Config.MAX_TEXT_LENGTH} कैरेक्टर है।")
-            return
-            
-        user_id = update.effective_user.id
-        settings = await self.db.get_user_settings(user_id)
-        
-        voice = settings.get("voice", "hi-IN-SwaraNeural")
-        fmt = settings.get("format", "mp3")
-        
-        load_msg = await update.message.reply_text("🎧 *AI मूड को रीड करके ऑडियो ट्रैक रेंडर कर रहा है...*", parse_mode="Markdown")
-        
-        try:
-            audio_data = await self.tts.synthesize(text, voice, output_format=fmt)
-            await self.db.add_history_entry(user_id, text, voice, fmt)
-            await load_msg.delete()
-            
-            await self.send_audio_file(
-                update, audio_data, 
-                filename=f"audio_{user_id}.{fmt}", 
-                caption=f"🎤 प्रोफाइल: `{voice}`\n📊 फ़ॉर्मेट: `{fmt.upper()}`"
-            )
-        except Exception as e:
-            logger.error(f"TTS Engine execution failure: {e}")
-            await load_msg.edit_text("❌ ऑडियो जनरेशन थ्रेड क्रैश हो गया। कृपया कुछ समय बाद पुनः प्रयास करें।")
-
-    async def send_audio_file(self, update: Update, audio_data: bytes, filename: str, caption: str):
-        audio_file = io.BytesIO(audio_data)
-        audio_file.name = filename
-        
-        if filename.endswith('.ogg'):
-            await update.message.reply_voice(voice=audio_file, caption=caption)
-        else:
-            await update.message.reply_audio(audio=audio_file, filename=filename, caption=caption, parse_mode="Markdown")
-
-    async def languages_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("🌍 *समर्थित मुख्य भाषाएँ:*\nHindi (🇮🇳), English (🇺🇸), Urdu (🇵🇰), Spanish (🇪🇸) सहित 100+ देश और 300+ न्यूरल वॉयस सिस्टम पूरी तरह वर्किंग हैं।", parse_mode="Markdown")
-
-    async def history_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        history = await self.db.get_user_history(update.effective_user.id)
-        if not history:
-            await update.message.reply_text("📭 इतिहास खाली है! बोट को कुछ टेक्स्ट भेजकर ऑडियो जेनरेट करें।")
-            return
-        msg = "📜 *आपकी हालिया हिस्ट्री ट्रैक सूची:*\n\n"
-        for i, h in enumerate(history[:5], 1):
-            msg += f"*{i}.* `{h['text'][:35]}...`\n🗣️ `{h['voice']}` | 📀 `{h['format'].upper()}`\n\n"
-        await update.message.reply_text(msg, parse_mode="Markdown")
-
-    async def settings_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        settings = await self.db.get_user_settings(update.effective_user.id)
-        msg = (
-            "⚙️ *आपकी एक्टिव कॉन्फ़िगरेशन प्रोफाइल:*\n\n"
-            f"🎙️ *डिफ़ॉल्ट वॉयस:* `{settings.get('voice', 'hi-IN-SwaraNeural')}`\n"
-            f"📀 *एक्सपोर्ट फ़ॉर्मेट:* `{settings.get('format', 'mp3').upper()}`\n"
-            "🌐 *AI मूड डिटेक्टर:* `Active (TextBlob/DistilBERT Guided)`"
-        )
-        await update.message.reply_text(msg, parse_mode="Markdown")
-
-    async def general_callbacks(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        if query.data == "ui_show_hist":
-            await self.history_command(update, context)
-        elif query.data == "ui_show_settings":
-            await self.settings_command(update, context)
-
-    async def cancel_conversation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("❌ वॉयस सिलेक्शन मॉड्यूल क्लोज कर दिया गया है।")
-        return ConversationHandler.END
-
-    async def cancel_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        await query.edit_message_text("❌ प्रोसेस निरस्त कर दी गई है। नया मॉड्यूल शुरू करने के लिए /start दबाएं।")
-        return ConversationHandler.END
-
-    async def run(self):
-        await self.db.init_db()
-        await self.tts.load_or_fetch_voices()  # Pre-fetch on system initialization sequence
-        await self.app.initialize()
-        await self.app.start()
-        await self.app.updater.start_polling()
-        logger.info("🚀 Master TTS System Polling Grid Online & Active.")
-
-# =====================================================================
-# 🏁 LIFECYCLE MANAGEMENT EXECUTION MODULE
-# =====================================================================
-async def main_async():
-    logger.info("Booting Orchestration Stack Sequence Core...")
-    bot = TTSBot()
-    await bot.run()
-    while True:
-        await asyncio.sleep(3600)
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main_async())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("System Engine safely shutdown by supervisor override.")
+            await update.message.reply_text("
