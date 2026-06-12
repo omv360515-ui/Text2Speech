@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Telegram Advanced TTS Bot – Final Working Version
-- No syntax errors, no missing brackets
-- Full TTS, voice pagination, admin commands
+Telegram TTS Bot – Simplified, Production Ready for Render
+No admin commands, no developer ID, just TTS with voice selection.
 """
 
 import sys
@@ -12,13 +11,13 @@ import json
 import logging
 import asyncio
 import hashlib
-from functools import wraps
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict
+from functools import wraps
 from typing import Dict, List, Tuple, Any, Optional
 
-# ========== DUMMY AUDIOOP FOR PYDUB ==========
+# ========== FIX: dummy audioop for pydub ==========
 if 'audioop' not in sys.modules:
     class DummyAudioOp:
         @staticmethod
@@ -68,7 +67,6 @@ if 'audioop' not in sys.modules:
     sys.modules['audioop'] = DummyAudioOp
 
 from pydub import AudioSegment
-import psutil
 import aiohttp
 import aiosqlite
 import edge_tts
@@ -88,45 +86,30 @@ load_dotenv()
 class Config:
     TELEGRAM_BOT_TOKEN = "8691786785:AAFQbqE8R1ZnULDOzVv0eKJ4XC2cCSsUGvU"
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN)
-    
-    # ⚠️ REPLACE WITH YOUR NUMERIC USER ID (get from @userinfobot)
-    DEVELOPER_ID = 123456789
-    
-    CHANNEL_LINK = "https://t.me/jorogamer"
-    
-    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///tts_bot.db")
+    CHANNEL_LINK = "https://t.me/jorogamer"  # Your channel link
+    DATABASE_URL = "sqlite+aiosqlite:///tts_bot.db"
     VOICES_DB_PATH = "voices_data.json"
-    AUDIO_OUTPUT_DIR = Path("generated_audio")
     MAX_TEXT_LENGTH = 5000
-    RATE_LIMIT_CALLS = 5
-    RATE_LIMIT_PERIOD = 60
-    PREFERRED_TTS = "edge_tts"
-    FALLBACK_TTS = "gtts"
     DEFAULT_FORMAT = "mp3"
     LOG_LEVEL = logging.INFO
 
-Config.AUDIO_OUTPUT_DIR.mkdir(exist_ok=True)
 logging.basicConfig(level=Config.LOG_LEVEL, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("TTSBot")
 
 SELECTING_VOICE, WAITING_FOR_TEXT = range(2)
 rate_limit_data = defaultdict(list)
 
-# ========== DATABASE ==========
+# ========== DATABASE (SQLite) ==========
 class Database:
     def __init__(self):
-        self.db_path = Config.DATABASE_URL.replace("sqlite+aiosqlite:///", "")
-    async def _get_connection(self):
-        return await aiosqlite.connect(self.db_path)
+        self.db_path = "tts_bot.db"
     async def init_db(self):
-        async with await self._get_connection() as conn:
+        async with aiosqlite.connect(self.db_path) as conn:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
                     username TEXT,
                     first_name TEXT,
-                    is_premium INTEGER DEFAULT 0,
-                    total_requests INTEGER DEFAULT 0,
                     settings TEXT DEFAULT '{}',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -137,17 +120,16 @@ class Database:
                     user_id INTEGER,
                     text TEXT,
                     voice TEXT,
-                    format TEXT DEFAULT 'mp3',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             await conn.commit()
     async def add_user(self, user_id, username=None, first_name=None):
-        async with await self._get_connection() as conn:
+        async with aiosqlite.connect(self.db_path) as conn:
             await conn.execute("INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)", (user_id, username, first_name))
             await conn.commit()
     async def get_user_settings(self, user_id):
-        async with await self._get_connection() as conn:
+        async with aiosqlite.connect(self.db_path) as conn:
             cursor = await conn.execute("SELECT settings FROM users WHERE user_id = ?", (user_id,))
             row = await cursor.fetchone()
             if row and row[0]:
@@ -159,42 +141,17 @@ class Database:
     async def update_user_setting(self, user_id, key, value):
         settings = await self.get_user_settings(user_id)
         settings[key] = value
-        async with await self._get_connection() as conn:
+        async with aiosqlite.connect(self.db_path) as conn:
             await conn.execute("UPDATE users SET settings = ? WHERE user_id = ?", (json.dumps(settings), user_id))
             await conn.commit()
-    async def add_history_entry(self, user_id, text, voice, audio_format="mp3"):
-        async with await self._get_connection() as conn:
-            await conn.execute("INSERT INTO history (user_id, text, voice, format) VALUES (?, ?, ?, ?)", (user_id, text, voice, audio_format))
-            await conn.execute("UPDATE users SET total_requests = total_requests + 1 WHERE user_id = ?", (user_id,))
+    async def add_history_entry(self, user_id, text, voice):
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute("INSERT INTO history (user_id, text, voice) VALUES (?, ?, ?)", (user_id, text, voice))
             await conn.commit()
-    async def get_user_history(self, user_id, limit=10):
-        async with await self._get_connection() as conn:
-            cursor = await conn.execute("SELECT text, voice, format, created_at FROM history WHERE user_id = ? ORDER BY created_at DESC LIMIT ?", (user_id, limit))
-            rows = await cursor.fetchall()
-            return [{"text": r[0], "voice": r[1], "format": r[2], "timestamp": r[3]} for r in rows]
-    async def get_all_users(self):
-        async with await self._get_connection() as conn:
-            cursor = await conn.execute("SELECT user_id, username, first_name, total_requests FROM users")
-            rows = await cursor.fetchall()
-            return rows
-
-# ========== EMOTION ANALYZER ==========
-class EmotionAnalyzer:
-    def analyze(self, text: str) -> Tuple[str, Dict[str, int]]:
-        blob = TextBlob(text)
-        polarity = blob.sentiment.polarity
-        if polarity > 0.1:
-            params = {"pitch": 15, "speed": 10, "volume": 5}
-        elif polarity < -0.1:
-            params = {"pitch": -15, "speed": -10, "volume": -5}
-        else:
-            params = {"pitch": 0, "speed": 0, "volume": 0}
-        return "NEUTRAL", params
 
 # ========== TTS ENGINE ==========
 class UnifiedTTS:
     def __init__(self):
-        self.analyzer = EmotionAnalyzer()
         self.cache = TTLCache(maxsize=100, ttl=3600)
         self.voices = []
         self.voices_cache_path = Path(Config.VOICES_DB_PATH)
@@ -213,7 +170,7 @@ class UnifiedTTS:
             self.voices = [{"Name": v["ShortName"], "ShortName": v["ShortName"], "Gender": v.get("Gender","Neutral"), "Locale": v.get("Locale","")} for v in raw]
             with open(self.voices_cache_path, "w") as f:
                 json.dump({"edge_tts": {"voices": self.voices}}, f)
-            logger.info(f"Fetched and cached {len(self.voices)} voices")
+            logger.info(f"Fetched {len(self.voices)} voices")
         except Exception as e:
             logger.error(f"Voice fetch failed: {e}, using fallback")
             self.voices = [
@@ -225,37 +182,21 @@ class UnifiedTTS:
         if not self.voices:
             await self.load_voices()
         return self.voices
-    async def synthesize(self, text, voice, provider=None, rate_override=None, pitch_override=None, volume_override=None, output_format="mp3"):
-        cache_key = hashlib.md5(f"{text}:{voice}:{rate_override}:{pitch_override}:{output_format}".encode()).hexdigest()
+    async def synthesize(self, text, voice, output_format="mp3"):
+        cache_key = hashlib.md5(f"{text}:{voice}".encode()).hexdigest()
         if cache_key in self.cache:
             return self.cache[cache_key]
-        _, emotion = self.analyzer.analyze(text)
-        speed = rate_override if rate_override is not None else emotion.get("speed", 0)
-        pitch = pitch_override if pitch_override is not None else emotion.get("pitch", 0)
-        volume = volume_override if volume_override is not None else emotion.get("volume", 0)
-        if provider is None:
-            provider = Config.PREFERRED_TTS
         try:
-            audio = await self._call_engine(text, voice, provider, speed, volume, pitch)
-            audio = await self._convert_format(audio, output_format)
-            self.cache[cache_key] = audio
-            return audio
-        except Exception as e:
-            logger.error(f"Primary failed: {e}, fallback to gTTS")
-            audio = await self._call_engine(text, voice, Config.FALLBACK_TTS, 0, 0, 0)
-            return await self._convert_format(audio, output_format)
-    async def _call_engine(self, text, voice, provider, rate, volume, pitch):
-        if provider == "edge_tts":
-            rate_str = f"{rate:+d}%" if rate != 0 else "0%"
-            vol_str = f"{volume:+d}%" if volume != 0 else "0%"
-            pitch_str = f"{pitch:+d}%" if pitch != 0 else "0%"
-            comm = edge_tts.Communicate(text, voice, rate=rate_str, volume=vol_str, pitch=pitch_str)
+            comm = edge_tts.Communicate(text, voice)
             data = bytearray()
             async for chunk in comm.stream():
                 if chunk["type"] == "audio":
                     data.extend(chunk["data"])
-            return bytes(data)
-        elif provider == "gtts":
+            audio = bytes(data)
+            self.cache[cache_key] = audio
+            return audio
+        except Exception as e:
+            logger.error(f"Edge TTS failed: {e}, fallback to gTTS")
             lang = voice.split('-')[0] if '-' in voice else 'hi'
             loop = asyncio.get_running_loop()
             tts = await loop.run_in_executor(None, lambda: gtts.gTTS(text, lang=lang))
@@ -263,18 +204,6 @@ class UnifiedTTS:
             await loop.run_in_executor(None, lambda: tts.write_to_fp(fp))
             fp.seek(0)
             return fp.read()
-        else:
-            raise ValueError("Unknown provider")
-    async def _convert_format(self, audio_bytes, target):
-        if target == "mp3":
-            return audio_bytes
-        try:
-            audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
-            out = io.BytesIO()
-            audio.export(out, format=target)
-            return out.getvalue()
-        except:
-            return audio_bytes
 
 # ========== RATE LIMIT ==========
 def rate_limit(limit, per):
@@ -310,9 +239,6 @@ class TTSBot:
         self.app.add_handler(CommandHandler("start", self.start))
         self.app.add_handler(CommandHandler("help", self.help))
         self.app.add_handler(CommandHandler("history", self.history))
-        self.app.add_handler(CommandHandler("settings", self.settings))
-        self.app.add_handler(CommandHandler("stats", self.stats_command))
-        self.app.add_handler(CommandHandler("broadcast", self.broadcast_command))
         conv = ConversationHandler(
             entry_points=[CommandHandler("voice", self.voice), CallbackQueryHandler(self.voice_trigger, pattern="^trigger_voice$")],
             states={
@@ -323,65 +249,31 @@ class TTSBot:
             fallbacks=[CommandHandler("cancel", self.cancel), CallbackQueryHandler(self.cancel_cb, pattern="^back$")]
         )
         self.app.add_handler(conv)
-        self.app.add_handler(CallbackQueryHandler(self.menu_callback, pattern="^(menu_history|menu_settings|menu_voice)$"))
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.direct_tts), group=1)
-    
-    async def stats_command(self, update, context):
-        if update.effective_user.id != Config.DEVELOPER_ID:
-            await update.message.reply_text("❌ अनधिकृत।")
-            return
-        users = await self.db.get_all_users()
-        total = len(users)
-        requests = sum(u[3] for u in users)
-        await update.message.reply_text(f"📊 आँकड़े\nउपयोगकर्ता: {total}\nकुल अनुरोध: {requests}")
-    
-    async def broadcast_command(self, update, context):
-        if update.effective_user.id != Config.DEVELOPER_ID:
-            await update.message.reply_text("❌ अनधिकृत।")
-            return
-        if not context.args:
-            await update.message.reply_text("उपयोग: /broadcast <संदेश>")
-            return
-        msg = " ".join(context.args)
-        users = await self.db.get_all_users()
-        sent = 0
-        for uid, _, _, _ in users:
-            try:
-                await context.bot.send_message(uid, f"📢 ब्रॉडकास्ट:\n{msg}")
-                sent += 1
-            except:
-                pass
-            await asyncio.sleep(0.05)
-        await update.message.reply_text(f"भेजा: {sent} उपयोगकर्ताओं को।")
     
     async def start(self, update, context):
         user = update.effective_user
         await self.db.add_user(user.id, user.username, user.first_name)
         kb = [
-            [InlineKeyboardButton("🎤 बदलें आवाज़", callback_data="trigger_voice"),
-             InlineKeyboardButton("⚙️ सेटिंग्स", callback_data="menu_settings")],
+            [InlineKeyboardButton("🎤 बदलें आवाज़", callback_data="trigger_voice")],
             [InlineKeyboardButton("📜 इतिहास", callback_data="menu_history")],
             [InlineKeyboardButton("📢 चैनल ज्वाइन करें", url=Config.CHANNEL_LINK)]
         ]
-        await update.message.reply_text(f"नमस्ते {user.first_name}! मैं AI TTS बॉट हूँ।\nकोई भी टेक्स्ट भेजें।", reply_markup=InlineKeyboardMarkup(kb))
+        await update.message.reply_text(f"नमस्ते {user.first_name}! मैं TTS बॉट हूँ। कोई भी टेक्स्ट भेजें, आवाज़ बनाऊँगा।", reply_markup=InlineKeyboardMarkup(kb))
     
     async def help(self, update, context):
-        await update.message.reply_text("कमांड्स: /start, /voice, /settings, /history\nटेक्स्ट सीधे भेजें।")
+        await update.message.reply_text("कमांड्स: /start, /voice, /history\nटेक्स्ट सीधे भेजें।")
     
     async def history(self, update, context):
         uid = update.effective_user.id
-        hist = await self.db.get_user_history(uid, 10)
-        if not hist:
+        async with aiosqlite.connect("tts_bot.db") as conn:
+            cursor = await conn.execute("SELECT text, voice, created_at FROM history WHERE user_id = ? ORDER BY created_at DESC LIMIT 10", (uid,))
+            rows = await cursor.fetchall()
+        if not rows:
             await update.message.reply_text("कोई इतिहास नहीं।")
             return
-        msg = "📜 हालिया:\n" + "\n".join([f"• {h['text'][:40]}... ({h['voice']})" for h in hist])
+        msg = "📜 हालिया:\n" + "\n".join([f"• {r[0][:40]}... ({r[1]})" for r in rows])
         await update.message.reply_text(msg)
-    
-    async def settings(self, update, context):
-        uid = update.effective_user.id
-        sets = await self.db.get_user_settings(uid)
-        voice = sets.get("voice", "hi-IN-SwaraNeural")
-        await update.message.reply_text(f"⚙️ सेटिंग्स:\nआवाज़: {voice}\n/voice से बदलें।")
     
     async def voice(self, update, context):
         voices = await self.tts.list_voices()
@@ -447,4 +339,58 @@ class TTSBot:
         voice = context.user_data.get("selected_voice", "hi-IN-SwaraNeural")
         await self.db.update_user_setting(update.effective_user.id, "voice", voice)
         proc = await update.message.reply_text("🎧 आवाज़ बन रही है...")
-      
+        try:
+            audio = await self.tts.synthesize(text, voice)
+            await self.db.add_history_entry(update.effective_user.id, text, voice)
+            await update.message.reply_audio(audio=audio, filename=f"tts.mp3")
+        except Exception as e:
+            await update.message.reply_text(f"❌ {e}")
+        finally:
+            await proc.delete()
+        return ConversationHandler.END
+    
+    async def direct_tts(self, update, context):
+        if context.user_data.get("state") == SELECTING_VOICE:
+            return
+        text = update.message.text
+        if text.startswith('/'):
+            return
+        uid = update.effective_user.id
+        sets = await self.db.get_user_settings(uid)
+        voice = sets.get("voice", "hi-IN-SwaraNeural")
+        proc = await update.message.reply_text("🎧 प्रोसेसिंग...")
+        try:
+            audio = await self.tts.synthesize(text, voice)
+            await self.db.add_history_entry(uid, text, voice)
+            await update.message.reply_audio(audio=audio, filename="speech.mp3")
+        except Exception as e:
+            await update.message.reply_text(f"❌ {e}")
+        finally:
+            await proc.delete()
+    
+    async def cancel(self, update, context):
+        await update.message.reply_text("❌ रद्द। /start")
+        return ConversationHandler.END
+    
+    async def cancel_cb(self, update, context):
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text("रद्द। /start")
+        return ConversationHandler.END
+    
+    async def run(self):
+        await self.tts.load_voices()
+        await self.db.init_db()
+        await self.app.initialize()
+        await self.app.start()
+        await self.app.updater.start_polling()
+        logger.info("Bot is running...")
+        await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    try:
+        bot = TTSBot()
+        asyncio.run(bot.run())
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        sys.exit(1)
