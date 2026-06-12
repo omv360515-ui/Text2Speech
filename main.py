@@ -68,6 +68,7 @@ if 'audioop' not in sys.modules:
 
 from pydub import AudioSegment
 import aiohttp
+from aiohttp import web
 import aiosqlite
 import edge_tts
 import gtts
@@ -383,8 +384,18 @@ class TTSBot:
         await self.db.init_db()
         await self.app.initialize()
         await self.app.start()
-        await self.app.updater.start_polling()
-        logger.info("Bot is running...")
+        await self.app.updater.start_polling(drop_pending_updates=True)
+
+        # Render Web Service health check ke liye dummy port open karo
+        port = int(os.environ.get("PORT", 10000))
+        web_app = web.Application()
+        web_app.router.add_get("/", lambda r: web.Response(text="Bot is running"))
+        runner = web.AppRunner(web_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+
+        logger.info(f"Bot running, port {port} listening...")
         await asyncio.Event().wait()
 
 if __name__ == "__main__":
