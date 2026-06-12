@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Telegram TTS Bot – Production Ready for Render
-No transformers, no Rust compilation. Works with Python 3.11+.
+Telegram Advanced TTS Bot – Final Deployable Version
+- One channel button: https://t.me/jorogamer
+- Developer commands: /stats, /broadcast (restricted to DEVELOPER_ID)
 """
 
 import sys
 import os
 import io
-import gc
 import json
 import logging
 import asyncio
@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import Dict, List, Tuple, Any, Optional
 
-# ========== FIX: Dummy audioop for pydub (Python 3.14 workaround) ==========
+# ========== DUMMY AUDIOOP FOR PYDUB ==========
 if 'audioop' not in sys.modules:
     class DummyAudioOp:
         @staticmethod
@@ -67,9 +67,7 @@ if 'audioop' not in sys.modules:
         def ulaw2lin(*args): return b''
     sys.modules['audioop'] = DummyAudioOp
 
-# Now safe to import pydub
 from pydub import AudioSegment
-
 import psutil
 import aiohttp
 import aiosqlite
@@ -78,7 +76,6 @@ import gtts
 from textblob import TextBlob
 from cachetools import TTLCache
 from dotenv import load_dotenv
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -89,9 +86,17 @@ load_dotenv()
 
 # ========== CONFIGURATION ==========
 class Config:
-    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not TELEGRAM_BOT_TOKEN:
-        raise ValueError("TELEGRAM_BOT_TOKEN missing in .env")
+    # Bot token (hardcoded as provided)
+    TELEGRAM_BOT_TOKEN = "8691786785:AAFQbqE8R1ZnULDOzVv0eKJ4XC2cCSsUGvU"
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN)
+    
+    # ⚠️ IMPORTANT: Replace this with your actual numeric Telegram user ID
+    # Get it from @userinfobot or by running /id command in any bot
+    DEVELOPER_ID = 123456789  # 🔁 CHANGE THIS TO YOUR REAL USER ID
+    
+    # Channel link (only one)
+    CHANNEL_LINK = "https://t.me/jorogamer"
+    
     DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///tts_bot.db")
     VOICES_DB_PATH = "voices_data.json"
     AUDIO_OUTPUT_DIR = Path("generated_audio")
@@ -170,8 +175,15 @@ class Database:
             cursor = await conn.execute("SELECT text, voice, format, created_at FROM history WHERE user_id = ? ORDER BY created_at DESC LIMIT ?", (user_id, limit))
             rows = await cursor.fetchall()
             return [{"text": r[0], "voice": r[1], "format": r[2], "timestamp": r[3]} for r in rows]
+    
+    # Admin methods
+    async def get_all_users(self):
+        async with await self._get_connection() as conn:
+            cursor = await conn.execute("SELECT user_id, username, first_name, total_requests FROM users")
+            rows = await cursor.fetchall()
+            return rows
 
-# ========== EMOTION ANALYZER (Lightweight, no transformers) ==========
+# ========== EMOTION ANALYZER ==========
 class EmotionAnalyzer:
     def analyze(self, text: str) -> Tuple[str, Dict[str, int]]:
         blob = TextBlob(text)
@@ -201,20 +213,22 @@ class UnifiedTTS:
                     data = json.load(f)
                     self.voices = data.get("edge_tts", {}).get("voices", [])
                     if self.voices:
+                        logger.info(f"Loaded {len(self.voices)} voices from cache")
                         return
             except: pass
-        # Fetch live
         try:
             raw = await edge_tts.list_voices()
             self.voices = [{"Name": v["ShortName"], "ShortName": v["ShortName"], "Gender": v.get("Gender","Neutral"), "Locale": v.get("Locale","")} for v in raw]
             with open(self.voices_cache_path, "w") as f:
                 json.dump({"edge_tts": {"voices": self.voices}}, f)
-            logger.info(f"Loaded {len(self.voices)} voices")
+            logger.info(f"Fetched and cached {len(self.voices)} voices")
         except Exception as e:
-            logger.error(f"Voice fetch failed: {e}")
-            self.voices = [{"Name":"hi-IN-SwaraNeural","ShortName":"hi-IN-SwaraNeural","Gender":"Female","Locale":"hi-IN"},
-                           {"Name":"hi-IN-MadhurNeural","ShortName":"hi-IN-MadhurNeural","Gender":"Male","Locale":"hi-IN"},
-                           {"Name":"en-US-JennyNeural","ShortName":"en-US-JennyNeural","Gender":"Female","Locale":"en-US"}]
+            logger.error(f"Voice fetch failed: {e}, using fallback voices")
+            self.voices = [
+                {"Name":"hi-IN-SwaraNeural","ShortName":"hi-IN-SwaraNeural","Gender":"Female","Locale":"hi-IN"},
+                {"Name":"hi-IN-MadhurNeural","ShortName":"hi-IN-MadhurNeural","Gender":"Male","Locale":"hi-IN"},
+                {"Name":"en-US-JennyNeural","ShortName":"en-US-JennyNeural","Gender":"Female","Locale":"en-US"}
+            ]
     async def list_voices(self):
         if not self.voices:
             await self.load_voices()
@@ -235,7 +249,7 @@ class UnifiedTTS:
             self.cache[cache_key] = audio
             return audio
         except Exception as e:
-            logger.error(f"Primary TTS failed: {e}, falling back")
+            logger.error(f"Primary TTS failed: {e}, falling back to gTTS")
             audio = await self._call_engine(text, voice, Config.FALLBACK_TTS, 0, 0, 0)
             return await self._convert_format(audio, output_format)
     async def _call_engine(self, text, voice, provider, rate, volume, pitch):
@@ -275,7 +289,6 @@ def rate_limit(limit, per):
     def decorator(func):
         @wraps(func)
         async def wrapper(self, update, context, *args, **kwargs):
-            # For callback queries, effective_message might be None; fallback to callback_query.message
             user = update.effective_user
             if not user:
                 return await func(self, update, context, *args, **kwargs)
@@ -308,6 +321,10 @@ class TTSBot:
         self.app.add_handler(CommandHandler("help", self.help))
         self.app.add_handler(CommandHandler("history", self.history))
         self.app.add_handler(CommandHandler("settings", self.settings))
+        # Admin commands (only for DEVELOPER_ID)
+        self.app.add_handler(CommandHandler("stats", self.stats_command))
+        self.app.add_handler(CommandHandler("broadcast", self.broadcast_command))
+        
         conv = ConversationHandler(
             entry_points=[CommandHandler("voice", self.voice), CallbackQueryHandler(self.voice_trigger, pattern="^trigger_voice$")],
             states={
@@ -319,15 +336,54 @@ class TTSBot:
         )
         self.app.add_handler(conv)
         self.app.add_handler(CallbackQueryHandler(self.menu_callback, pattern="^(menu_history|menu_settings|menu_voice)$"))
-        # Direct text without command (only if not in conversation)
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.direct_tts), group=1)
+    
+    # ========== ADMIN COMMANDS ==========
+    async def stats_command(self, update, context):
+        if update.effective_user.id != Config.DEVELOPER_ID:
+            await update.message.reply_text("❌ आपके पास इस कमांड की अनुमति नहीं है।")
+            return
+        users = await self.db.get_all_users()
+        total_users = len(users)
+        total_requests = sum(u[3] for u in users)
+        await update.message.reply_text(f"📊 **बॉट आँकड़े**\n\nकुल उपयोगकर्ता: {total_users}\nकुल अनुरोध: {total_requests}", parse_mode="Markdown")
+    
+    async def broadcast_command(self, update, context):
+        if update.effective_user.id != Config.DEVELOPER_ID:
+            await update.message.reply_text("❌ अनधिकृत।")
+            return
+        if not context.args:
+            await update.message.reply_text("उपयोग: /broadcast <संदेश>")
+            return
+        message = " ".join(context.args)
+        users = await self.db.get_all_users()
+        sent = 0
+        failed = 0
+        for user_id, _, _, _ in users:
+            try:
+                await context.bot.send_message(chat_id=user_id, text=f"📢 **ब्रॉडकास्ट**\n\n{message}", parse_mode="Markdown")
+                sent += 1
+            except:
+                failed += 1
+            await asyncio.sleep(0.05)
+        await update.message.reply_text(f"भेजे गए: {sent}\nअसफल: {failed}")
+    
+    # ========== USER COMMANDS ==========
     async def start(self, update, context):
         user = update.effective_user
         await self.db.add_user(user.id, user.username, user.first_name)
-        kb = [[InlineKeyboardButton("🎤 बदलें आवाज़", callback_data="trigger_voice"),
-               InlineKeyboardButton("⚙️ सेटिंग्स", callback_data="menu_settings")],
-              [InlineKeyboardButton("📜 इतिहास", callback_data="menu_history")]]
-        await update.message.reply_text(f"नमस्ते {user.first_name}! मैं TTS बॉट हूँ। कोई भी टेक्स्ट भेजें, आवाज़ बनाऊँगा।", reply_markup=InlineKeyboardMarkup(kb))
+        kb = [
+            [InlineKeyboardButton("🎤 बदलें आवाज़", callback_data="trigger_voice"),
+             InlineKeyboardButton("⚙️ सेटिंग्स", callback_data="menu_settings")],
+            [InlineKeyboardButton("📜 इतिहास", callback_data="menu_history")],
+            [InlineKeyboardButton("📢 चैनल ज्वाइन करें", url=Config.CHANNEL_LINK)]
+        ]
+        await update.message.reply_text(
+            f"नमस्ते {user.first_name}! मैं AI Text-to-Speech बॉट हूँ।\n"
+            f"कोई भी टेक्स्ट भेजें, मैं आवाज़ बनाऊँगा।\n\n"
+            f"👇 हमारा चैनल ज्वाइन करें:",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
     async def help(self, update, context):
         await update.message.reply_text("कमांड्स: /start, /voice, /settings, /history\nटेक्स्ट सीधे भेजें या /tts <text>")
     async def history(self, update, context):
@@ -387,51 +443,4 @@ class TTSBot:
         page = int(query.data.split("_")[2])
         context.user_data["voice_page"] = page
         await self._send_voice_page(update, context, page)
-    async def voice_select(self, update, context):
-        query = update.callback_query
-        await query.answer()
-        voice_id = query.data.split("_", 1)[1]
-        context.user_data["selected_voice"] = voice_id
-        await query.edit_message_text(f"✅ आवाज़ चुन ली: {voice_id}\nअब टेक्स्ट भेजें:")
-        return WAITING_FOR_TEXT
-    async def handle_text(self, update, context):
-        text = update.message.text
-        if len(text) > Config.MAX_TEXT_LENGTH:
-            await update.message.reply_text(f"टेक्स्ट बहुत लंबा है (अधिकतम {Config.MAX_TEXT_LENGTH} अक्षर)")
-            return WAITING_FOR_TEXT
-        voice = context.user_data.get("selected_voice", "hi-IN-SwaraNeural")
-        await self.db.update_user_setting(update.effective_user.id, "voice", voice)
-        proc_msg = await update.message.reply_text("🎧 आवाज़ बन रही है...")
-        try:
-            audio = await self.tts.synthesize(text, voice, output_format=Config.DEFAULT_FORMAT)
-            await self.db.add_history_entry(update.effective_user.id, text, voice)
-            await update.message.reply_audio(audio=audio, filename=f"tts_{update.effective_user.id}.mp3")
-        except Exception as e:
-            await update.message.reply_text(f"❌ त्रुटि: {str(e)}")
-        finally:
-            await proc_msg.delete()
-        return ConversationHandler.END
-    async def direct_tts(self, update, context):
-        # Only if not already in a conversation (context.user_data has no state)
-        if context.user_data.get("state") == SELECTING_VOICE:
-            return
-        text = update.message.text
-        if text.startswith('/'):
-            return
-        uid = update.effective_user.id
-        settings = await self.db.get_user_settings(uid)
-        voice = settings.get("voice", "hi-IN-SwaraNeural")
-        proc = await update.message.reply_text("🎧 प्रोसेसिंग...")
-        try:
-            audio = await self.tts.synthesize(text, voice)
-            await self.db.add_history_entry(uid, text, voice)
-            await update.message.reply_audio(audio=audio, filename="speech.mp3")
-        except Exception as e:
-            await update.message.reply_text(f"❌ {e}")
-        finally:
-            await proc.delete()
-    async def menu_callback(self, update, context):
-        query = update.callback_query
-        await query.answer()
-        if query.data == "menu_voice":
-     
+    async
