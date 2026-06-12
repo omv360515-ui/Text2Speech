@@ -366,10 +366,9 @@ def rate_limit(limit: int, per: int):
             
             if len(rate_limit_data[user_id]) >= limit:
                 wait_time = (rate_limit_data[user_id][0] + timedelta(seconds=per) - now).seconds
-                await update.effective_message.reply_text(
-                    f"⏳ *स्पैम सुरक्षा अलर्ट!*\nकृपया थोड़ा रुकें, {wait_time} सेकंड बाद दोबारा प्रयास करें।",
-                    parse_mode="Markdown"
-                )
+                # Fixed string formatting issue here completely
+                alert_text = f"⏳ स्पैम सुरक्षा अलर्ट! कृपया थोड़ा रुकें, {wait_time} सेकंड बाद दोबारा प्रयास करें।"
+                await update.effective_message.reply_text(alert_text)
                 return
             
             rate_limit_data[user_id].append(now)
@@ -421,26 +420,23 @@ class TTSBot:
              InlineKeyboardButton("⚙️ सेटिंग्स", callback_data="ui_show_settings")],
             [InlineKeyboardButton("📊 हिस्ट्री", callback_data="ui_show_hist")]
         ]
-        await update.message.reply_text(
-            f"👋 स्वागत है {user.first_name}!\n\n"
-            "मैं एक इंटेलिजेंट *AI Text-to-Speech (TTS)* बॉट हूँ।\n"
-            "मुझे कोई भी टेक्स्ट मैसेज भेजें, मैं उसका मूड एनालाइज करके उसे Real Sounding Voice में बदल दूँगा।",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
+        
+        welcome_text = f"👋 स्वागत है {user.first_name}! मैं एक इंटेलिजेंट AI Text-to-Speech बॉट हूँ। मुझे कोई भी टेक्स्ट भेजें, मैं उसे रियल साउंडिंग वॉइस में बदल दूँगा।"
+        await update.message.reply_text(welcome_text, reply_markup=InlineKeyboardMarkup(keyboard))
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "📖 *उपलब्ध कमान्ड्स गाइड:*\n\n"
-            "/start - होम डैशबोर्ड खोलें\n"
-            "/voice - 300+ भाषाओं और आवाज़ों की लिस्ट बदलें\n"
-            "/settings - आपकी मौजूदा एक्टिव कॉन्फ़िगरेशन\n"
-            "/history - आपके द्वारा बनाए गए पिछले ऑडियो ट्रैक\n\n"
-            "💡 *शॉर्टकट:* बिना किसी कमांड के सीधे टेक्स्ट टाइप करें, बोट तुरंत ऑडियो जेनरेट कर देगा।",
-            parse_mode="Markdown"
-        )
+        help_text = "📖 कमांड्स गाइड:\n\n/start - होम डैशबोर्ड\n/voice - वॉयस लिस्ट बदलें\n/settings - आपकी कॉन्फ़िगरेशन\n/history - आपकी हिस्ट्री\n\n💡 शॉर्टकट: सीधे टेक्स्ट टाइप करके भेजें।"
+        await update.message.reply_text(help_text)
 
     async def voice_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         voices = await self.tts.list_voices("edge_tts")
         if not voices:
-            await update.message.reply_text("
+            await update.message.reply_text("❌ वर्तमान में कोई वॉयस उपलब्ध नहीं है।")
+            return ConversationHandler.END
+        
+        context.user_data["all_voices"] = voices
+        context.user_data["voice_page"] = 0
+        await self._send_voice_page(update, context, 0)
+        return SELECTING_VOICE
+
+    async def voice_work
