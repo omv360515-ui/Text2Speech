@@ -7,4 +7,3 @@ aiohttp==3.9.5
 aiosqlite==0.20.0
 textblob==0.18.0
 cachetools==5.5.0
-psutil==5.9.8
